@@ -82,11 +82,6 @@ export class LogseqToAnkiSync {
             getTemplateMediaFiles()
         );
 
-        // -- Prepare Anki Note Manager --
-        const ankiNoteManager = new LazyAnkiNoteManager(this.modelName);
-        await ankiNoteManager.init();
-        Note.setAnkiNoteManager(ankiNoteManager);
-
         // -- Get the notes that are to be synced from logseq --
         const scanNotification = new ProgressNotification(
             `Scanning Logseq Graph <span style="opacity: 0.8">[${this.graphName}]</span>:`,
@@ -104,6 +99,31 @@ export class LogseqToAnkiSync {
         scanNotification.increment();
         await new Promise((resolve) => setTimeout(resolve, 1000)); // wait 1 sec
         scanNotification.increment();
+
+        // -- Collect all unique model names --
+        const allModelNames = new Set([this.modelName]);
+        for (const note of notes) {
+            const customModelName = note.properties['ankiNoteType'] || note.properties['anki-note-type'];
+            if (customModelName) {
+                allModelNames.add(customModelName);
+            }
+        }
+
+        // -- Prepare Anki Note Managers for all models --
+        const ankiNoteManagers = new Map<string, LazyAnkiNoteManager>();
+        for (const modelName of allModelNames) {
+            const manager = new LazyAnkiNoteManager(modelName);
+            try {
+                await manager.init();
+                ankiNoteManagers.set(modelName, manager);
+            } catch (e) {
+                console.warn(`Failed to initialize manager for model: ${modelName}`, e);
+            }
+        }
+
+        // Set the default manager for backward compatibility
+        const ankiNoteManager = ankiNoteManagers.get(this.modelName);
+        Note.setAnkiNoteManager(ankiNoteManager);
 
         for (const note of notes) {
             // Force persistance of note's logseq block uuid across re-index by adding id property to block in logseq
@@ -128,16 +148,47 @@ export class LogseqToAnkiSync {
         const toCreateNotesOriginal = new Array<Note>(),
             toUpdateNotesOriginal = new Array<Note>(),
             toDeleteNotesOriginal = new Array<number>();
+        // Helper function to get AnkiId from appropriate manager
+        const getAnkiIdFromManagers = (note: Note): number => {
+            const customModelName = note.properties['ankiNoteType'] || note.properties['anki-note-type'];
+            const targetModelName = customModelName || this.modelName;
+            const targetManager = ankiNoteManagers.get(targetModelName);
+
+            if (!targetManager) {
+                console.warn(`No manager found for model: ${targetModelName}`);
+                return null;
+            }
+
+            // Search in target manager's note map
+            const ankiNotesArr = Array.from(targetManager.noteInfoMap.values());
+            const filteredankiNotesArr = ankiNotesArr.filter(
+                (ankiNote) => ankiNote.fields["uuid"]?.value == note.uuid,
+            );
+
+            if (filteredankiNotesArr.length == 0) return null;
+            else return parseInt(filteredankiNotesArr[0].noteId);
+        };
+
         for (const note of notes) {
-            const ankiId = await note.getAnkiId();
+            const ankiId = getAnkiIdFromManagers(note);
             if (ankiId == null || isNaN(ankiId)) toCreateNotesOriginal.push(note);
-            else toUpdateNotesOriginal.push(note);
+            else {
+                note["ankiId"] = ankiId; // Cache the result
+                toUpdateNotesOriginal.push(note);
+            }
         }
-        const noteAnkiIds: Array<number> = await Promise.all(
-            notes.map((block) => block.getAnkiId()),
-        ); // Flatten current logseq block's anki ids
-        const AnkiIds: Array<number> = [...ankiNoteManager.noteInfoMap.keys()];
-        for (const ankiId of AnkiIds) {
+        const noteAnkiIds: Array<number> = notes.map((note) => {
+            const ankiId = getAnkiIdFromManagers(note);
+            return ankiId;
+        }).filter(id => id != null); // Flatten current logseq block's anki ids
+
+        // Collect all AnkiIds from all managers
+        const allAnkiIds: Array<number> = [];
+        for (const manager of ankiNoteManagers.values()) {
+            allAnkiIds.push(...manager.noteInfoMap.keys());
+        }
+
+        for (const ankiId of allAnkiIds) {
             if (!noteAnkiIds.includes(ankiId)) {
                 toDeleteNotesOriginal.push(ankiId);
             }
@@ -215,11 +266,11 @@ export class LogseqToAnkiSync {
                 1,
             "anki",
         );
-        await this.createNotes(toCreateNotes, failedCreated, ankiNoteManager, syncNotificationObj);
-        await this.updateNotes(toUpdateNotes, failedUpdated, ankiNoteManager, syncNotificationObj);
-        await this.deleteNotes(toDeleteNotes, failedDeleted, ankiNoteManager, syncNotificationObj);
+        await this.createNotes(toCreateNotes, failedCreated, ankiNoteManagers, syncNotificationObj);
+        await this.updateNotes(toUpdateNotes, failedUpdated, ankiNoteManagers, syncNotificationObj);
+        await this.deleteNotes(toDeleteNotes, failedDeleted, ankiNoteManagers, syncNotificationObj);
         await syncNotificationObj.updateMessage("Syncing logseq assets to anki...");
-        await this.updateAssets(ankiNoteManager);
+        await this.updateAssets(ankiNoteManagers);
         await syncNotificationObj.increment(twentyPercent);
         await AnkiConnect.invoke("reloadCollection", {});
         await syncNotificationObj.increment();
@@ -289,14 +340,21 @@ export class LogseqToAnkiSync {
     private async createNotes(
         toCreateNotes: Note[],
         failedCreated: { [key: string]: any },
-        ankiNoteManager: LazyAnkiNoteManager,
+        ankiNoteManagers: Map<string, LazyAnkiNoteManager>,
         syncNotificationObj: ProgressNotification,
     ): Promise<void> {
         for (const note of toCreateNotes) {
             try {
-                const [html, assets, deck, breadcrumb, tags, extra] = await this.parseNote(
+                const [html, assets, deck, breadcrumb, tags, extra, modelName] = await this.parseNote(
                     note,
                 );
+
+                // Get appropriate manager for this note's model
+                const ankiNoteManager = ankiNoteManagers.get(modelName);
+                if (!ankiNoteManager) {
+                    throw new Error(`No manager found for model: ${modelName}`);
+                }
+
                 const dependencyHash = await NoteHashCalculator.getHash(note, [
                     html,
                     Array.from(assets),
@@ -316,7 +374,7 @@ export class LogseqToAnkiSync {
                 // Create note
                 ankiNoteManager.addNote(
                     deck,
-                    this.modelName,
+                    modelName,
                     {
                         "uuid-type": `${note.uuid}-${note.type}`,
                         uuid: note.uuid,
@@ -337,30 +395,34 @@ export class LogseqToAnkiSync {
             syncNotificationObj.increment();
         }
 
-        let [addedNoteAnkiIdUUIDPairs, subOperationResults] = await ankiNoteManager.execute(
-            "addNotes",
-        );
-        for (const addedNoteAnkiIdUUIDPair of addedNoteAnkiIdUUIDPairs) {
-            // update ankiId of added blocks
-            const uuidtype = addedNoteAnkiIdUUIDPair["uuid-type"];
-            const uuid = uuidtype.split("-").slice(0, -1).join("-");
-            const type = uuidtype.split("-").slice(-1)[0];
-            const note = _.find(toCreateNotes, {uuid: uuid, type: type});
-            note["ankiId"] = addedNoteAnkiIdUUIDPair["ankiId"];
-            console.log(note);
-        }
+        // Execute addNotes for all managers
+        for (const manager of ankiNoteManagers.values()) {
+            let [addedNoteAnkiIdUUIDPairs, subOperationResults] = await manager.execute("addNotes");
 
-        for (const subOperationResult of subOperationResults) {
-            if (subOperationResult != null && subOperationResult.error != null) {
-                console.log(subOperationResult.error);
-                failedCreated[subOperationResult["uuid-type"]] = subOperationResult.error;
+            for (const addedNoteAnkiIdUUIDPair of addedNoteAnkiIdUUIDPairs) {
+                // update ankiId of added blocks
+                const uuidtype = addedNoteAnkiIdUUIDPair["uuid-type"];
+                const uuid = uuidtype.split("-").slice(0, -1).join("-");
+                const type = uuidtype.split("-").slice(-1)[0];
+                const note = _.find(toCreateNotes, {uuid: uuid, type: type});
+                if (note) {
+                    note["ankiId"] = addedNoteAnkiIdUUIDPair["ankiId"];
+                    console.log(note);
+                }
             }
-        }
 
-        subOperationResults = await ankiNoteManager.execute("addNotes");
-        for (const subOperationResult of subOperationResults) {
-            if (subOperationResult != null && subOperationResult.error != null) {
-                console.error(subOperationResult.error);
+            for (const subOperationResult of subOperationResults) {
+                if (subOperationResult != null && subOperationResult.error != null) {
+                    console.log(subOperationResult.error);
+                    failedCreated[subOperationResult["uuid-type"]] = subOperationResult.error;
+                }
+            }
+
+            subOperationResults = await manager.execute("addNotes");
+            for (const subOperationResult of subOperationResults) {
+                if (subOperationResult != null && subOperationResult.error != null) {
+                    console.error(subOperationResult.error);
+                }
             }
         }
     }
@@ -368,13 +430,21 @@ export class LogseqToAnkiSync {
     private async updateNotes(
         toUpdateNotes: Note[],
         failedUpdated: { [key: string]: any },
-        ankiNoteManager: LazyAnkiNoteManager,
+        ankiNoteManagers: Map<string, LazyAnkiNoteManager>,
         syncNotificationObj: ProgressNotification,
     ): Promise<void> {
         const graphPath = (await logseq.App.getCurrentGraph()).path;
         for (const note of toUpdateNotes) {
             try {
                 const ankiId = note.getAnkiId();
+
+                // Find the appropriate manager for this note
+                const [html, assets, deck, breadcrumb, tags, extra, modelName] = await this.parseNote(note);
+                const ankiNoteManager = ankiNoteManagers.get(modelName);
+                if (!ankiNoteManager) {
+                    throw new Error(`No manager found for model: ${modelName}`);
+                }
+
                 // Calculate Dependency Hash - It is the hash of all dependencies of the note
                 // (dependencies include related logseq blocks, related logseq pages, plugin version, current note content in anki etc)
                 const ankiNodeInfo = ankiNoteManager.noteInfoMap.get(ankiId);
@@ -405,10 +475,7 @@ export class LogseqToAnkiSync {
                     logseq.settings.skipOnDependencyHashMatch != true ||
                     oldConfig.dependencyHash != dependencyHash
                 ) {
-                    // Reparse Note + update assets + update                    // Parse Note
-                    const [html, assets, deck, breadcrumb, tags, extra] = await this.parseNote(
-                        note,
-                    );
+                    // Recalculate dependency hash with new content
                     dependencyHash = await NoteHashCalculator.getHash(note, [
                         html,
                         Array.from(assets),
@@ -430,10 +497,11 @@ export class LogseqToAnkiSync {
                         console.log(
                             `dependencyHash mismatch for note with id ${note.uuid}-${note.type}`,
                         );
+
                     ankiNoteManager.updateNote(
                         ankiId,
                         deck,
-                        this.modelName,
+                        modelName,
                         {
                             "uuid-type": `${note.uuid}-${note.type}`,
                             uuid: note.uuid,
@@ -464,22 +532,27 @@ export class LogseqToAnkiSync {
             syncNotificationObj.increment();
         }
 
-        let subOperationResults = await ankiNoteManager.execute("updateNotes");
-        for (const subOperationResult of subOperationResults) {
-            if (subOperationResult != null && subOperationResult.error != null) {
-                console.error(subOperationResult.error);
-                failedUpdated[subOperationResult["uuid-type"]] = subOperationResult.error;
+        // Execute updateNotes for all managers
+        for (const manager of ankiNoteManagers.values()) {
+            let subOperationResults = await manager.execute("updateNotes");
+            for (const subOperationResult of subOperationResults) {
+                if (subOperationResult != null && subOperationResult.error != null) {
+                    console.error(subOperationResult.error);
+                    failedUpdated[subOperationResult["uuid-type"]] = subOperationResult.error;
+                }
             }
         }
     }
 
     private async updateAssets(
-        ankiNoteManager: LazyAnkiNoteManager
+        ankiNoteManagers: Map<string, LazyAnkiNoteManager>
     ): Promise<void> {
-        let subOperationResults = await ankiNoteManager.execute("storeAssets");
-        for (const subOperationResult of subOperationResults) {
-            if (subOperationResult != null && subOperationResult.error != null) {
-                console.error(subOperationResult.error);
+        for (const manager of ankiNoteManagers.values()) {
+            let subOperationResults = await manager.execute("storeAssets");
+            for (const subOperationResult of subOperationResults) {
+                if (subOperationResult != null && subOperationResult.error != null) {
+                    console.error(subOperationResult.error);
+                }
             }
         }
     }
@@ -487,26 +560,46 @@ export class LogseqToAnkiSync {
     private async deleteNotes(
         toDeleteNotes: number[],
         failedDeleted : { [key: string]: any },
-        ankiNoteManager: LazyAnkiNoteManager,
+        ankiNoteManagers: Map<string, LazyAnkiNoteManager>,
         syncNotificationObj: ProgressNotification,
     ) {
+        // Find which manager contains each note to delete
         for (const ankiId of toDeleteNotes) {
-            ankiNoteManager.deleteNote(ankiId);
+            let foundManager = null;
+            for (const manager of ankiNoteManagers.values()) {
+                if (manager.noteInfoMap.has(ankiId)) {
+                    foundManager = manager;
+                    break;
+                }
+            }
+            if (foundManager) {
+                foundManager.deleteNote(ankiId);
+            }
             syncNotificationObj.increment();
         }
-        const subOperationResults = await ankiNoteManager.execute("deleteNotes");
-        for (const subOperationResult of subOperationResults) {
-            if (subOperationResult != null && subOperationResult.error != null) {
-                console.error(subOperationResult.error);
-                failedDeleted[subOperationResult.error.ankiId] = subOperationResult.error;
+
+        // Execute deleteNotes for all managers
+        for (const manager of ankiNoteManagers.values()) {
+            const subOperationResults = await manager.execute("deleteNotes");
+            for (const subOperationResult of subOperationResults) {
+                if (subOperationResult != null && subOperationResult.error != null) {
+                    console.error(subOperationResult.error);
+                    failedDeleted[subOperationResult.error.ankiId] = subOperationResult.error;
+                }
             }
         }
     }
 
     private async parseNote(
         note: Note,
-    ): Promise<[string, Set<string>, string, string, string[], string]> {
+    ): Promise<[string, Set<string>, string, string, string[], string, string]> {
         let {html, assets, tags} = await note.getClozedContentHTML();
+
+        // Check for custom note type property
+        const customModelName = note.properties['ankiNoteType'] || note.properties['anki-note-type'];
+        let modelName = customModelName || this.modelName;
+
+        console.log('modelName', modelName);
 
         if (logseq.settings.includeParentContent) {
             let newHtml = "";
@@ -694,6 +787,6 @@ export class LogseqToAnkiSync {
         assets = new Set([...assets, ...extra.assets]);
         extra = extra.html;
 
-        return [html, assets, deck, breadcrumb, tags, extra];
+        return [html, assets, deck, breadcrumb, tags, extra, modelName];
     }
 }
