@@ -1,6 +1,6 @@
 {
     "name": "logseq-anki-sync-custom-note-types",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "title": "Logseq Anki Sync - Custom Note Types",
     "description": "Enhanced logseq-anki-sync with custom note type support. Based on logseq-anki-sync v6.5.0 - supports image occlusion, card direction, incremental cards, and custom Anki note types.",
     "main": "dist/index.html",

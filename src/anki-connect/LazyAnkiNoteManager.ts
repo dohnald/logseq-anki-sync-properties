@@ -135,6 +135,10 @@ export class LazyAnkiNoteManager {
 
         let needsFieldUpdate = false;
         for (const key in fields) {
+            if (!noteinfo.fields[key]) {
+                console.warn(`Field '${key}' does not exist in Anki note type, skipping`);
+                continue;
+            }
             if (noteinfo.fields[key].value != fields[key]) {
                 if (logseq.settings.debug.includes("LazyAnkiNoteManager.ts"))
                     console.log(

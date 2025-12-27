@@ -345,7 +345,7 @@ export class LogseqToAnkiSync {
     ): Promise<void> {
         for (const note of toCreateNotes) {
             try {
-                const [html, assets, deck, breadcrumb, tags, extra, modelName] = await this.parseNote(
+                const [html, assets, deck, breadcrumb, tags, extra, modelName, customFields] = await this.parseNote(
                     note,
                 );
 
@@ -372,10 +372,11 @@ export class LogseqToAnkiSync {
                     );
                 });
                 // Create note
-                ankiNoteManager.addNote(
-                    deck,
-                    modelName,
-                    {
+                let fields: Record<string, string>;
+                if (note.properties['ankiNoteType'] || note.properties['anki-note-type']) {
+                    // Custom mode: use property-driven field mapping
+                    fields = {
+                        ...customFields,
                         "uuid-type": `${note.uuid}-${note.type}`,
                         uuid: note.uuid,
                         Text: html,
@@ -385,7 +386,26 @@ export class LogseqToAnkiSync {
                             dependencyHash,
                             assets: [...assets],
                         }),
-                    },
+                    };
+                } else {
+                    // Legacy mode: use existing field structure
+                    fields = {
+                        "uuid-type": `${note.uuid}-${note.type}`,
+                        uuid: note.uuid,
+                        Text: html,
+                        Extra: extra,
+                        Breadcrumb: breadcrumb,
+                        Config: JSON.stringify({
+                            dependencyHash,
+                            assets: [...assets],
+                        }),
+                    };
+                }
+
+                ankiNoteManager.addNote(
+                    deck,
+                    modelName,
+                    fields,
                     tags,
                 );
             } catch (e) {
@@ -436,10 +456,28 @@ export class LogseqToAnkiSync {
         const graphPath = (await logseq.App.getCurrentGraph()).path;
         for (const note of toUpdateNotes) {
             try {
-                const ankiId = note.getAnkiId();
+                // Use appropriate manager to get ankiId for custom note types
+                const customModelName = note.properties['ankiNoteType'] || note.properties['anki-note-type'];
+                const targetModelName = customModelName || this.modelName;
+                const targetManager = ankiNoteManagers.get(targetModelName);
+
+                let ankiId = null;
+                if (targetManager) {
+                    const filteredankiNotesArr = Array.from(targetManager.noteInfoMap.values()).filter(
+                        (noteInfo) => noteInfo.fields["uuid-type"].value == `${note.uuid}-${note.type}`,
+                    );
+                    if (filteredankiNotesArr.length > 0) {
+                        ankiId = parseInt(filteredankiNotesArr[0].noteId);
+                    }
+                }
+
+                if (!ankiId) {
+                    console.warn(`No ankiId found for note ${note.uuid}-${note.type}, skipping update`);
+                    continue;
+                }
 
                 // Find the appropriate manager for this note
-                const [html, assets, deck, breadcrumb, tags, extra, modelName] = await this.parseNote(note);
+                const [html, assets, deck, breadcrumb, tags, extra, modelName, customFields] = await this.parseNote(note);
                 const ankiNoteManager = ankiNoteManagers.get(modelName);
                 if (!ankiNoteManager) {
                     throw new Error(`No manager found for model: ${modelName}`);
@@ -448,20 +486,25 @@ export class LogseqToAnkiSync {
                 // Calculate Dependency Hash - It is the hash of all dependencies of the note
                 // (dependencies include related logseq blocks, related logseq pages, plugin version, current note content in anki etc)
                 const ankiNodeInfo = ankiNoteManager.noteInfoMap.get(ankiId);
+                if (!ankiNodeInfo) {
+                    console.warn(`No ankiNodeInfo found for ankiId ${ankiId}, skipping update`);
+                    continue;
+                }
                 const oldConfig = ((configString) => {
                     try {
                         return JSON.parse(configString);
                     } catch (e) {
                         return {};
                     }
-                })(ankiNodeInfo.fields.Config.value);
-                const [oldHtml, oldAssets, oldDeck, oldBreadcrumb, oldTags, oldExtra] = [
-                    ankiNodeInfo.fields.Text.value,
+                })(ankiNodeInfo.fields.Config?.value || '{}');
+                // Handle different field structures for custom vs legacy notes
+                const oldHtml = ankiNodeInfo.fields.Text?.value || ankiNodeInfo.fields.front?.value || '';
+                const oldBreadcrumb = ankiNodeInfo.fields.Breadcrumb?.value || '';
+                const oldExtra = ankiNodeInfo.fields.Extra?.value || '';
+                const [oldAssets, oldDeck, oldTags] = [
                     oldConfig.assets,
                     ankiNodeInfo.deck,
-                    ankiNodeInfo.fields.Breadcrumb.value,
                     ankiNodeInfo.tags,
-                    ankiNodeInfo.fields.Extra.value,
                 ];
                 let dependencyHash = await NoteHashCalculator.getHash(note, [
                     oldHtml,
@@ -498,11 +541,11 @@ export class LogseqToAnkiSync {
                             `dependencyHash mismatch for note with id ${note.uuid}-${note.type}`,
                         );
 
-                    ankiNoteManager.updateNote(
-                        ankiId,
-                        deck,
-                        modelName,
-                        {
+                    let fields: Record<string, string>;
+                    if (note.properties['ankiNoteType'] || note.properties['anki-note-type']) {
+                        // Custom mode: use property-driven field mapping
+                        fields = {
+                            ...customFields,
                             "uuid-type": `${note.uuid}-${note.type}`,
                             uuid: note.uuid,
                             Text: html,
@@ -512,7 +555,27 @@ export class LogseqToAnkiSync {
                                 dependencyHash,
                                 assets: [...assets],
                             }),
-                        },
+                        };
+                    } else {
+                        // Legacy mode: use existing field structure
+                        fields = {
+                            "uuid-type": `${note.uuid}-${note.type}`,
+                            uuid: note.uuid,
+                            Text: html,
+                            Extra: extra,
+                            Breadcrumb: breadcrumb,
+                            Config: JSON.stringify({
+                                dependencyHash,
+                                assets: [...assets],
+                            }),
+                        };
+                    }
+
+                    ankiNoteManager.updateNote(
+                        ankiId,
+                        deck,
+                        modelName,
+                        fields,
                         tags,
                     );
                 } else {
@@ -592,14 +655,58 @@ export class LogseqToAnkiSync {
 
     private async parseNote(
         note: Note,
-    ): Promise<[string, Set<string>, string, string, string[], string, string]> {
+    ): Promise<[string, Set<string>, string, string, string[], string, string, Record<string, string>]> {
         let {html, assets, tags} = await note.getClozedContentHTML();
 
         // Check for custom note type property
         const customModelName = note.properties['ankiNoteType'] || note.properties['anki-note-type'];
         let modelName = customModelName || this.modelName;
+        let customFields: Record<string, string> = {};
 
         console.log('modelName', modelName);
+
+        // If custom note type is specified, process all properties for field mapping
+        if (customModelName) {
+            // Process all properties for field mappings (except system properties)
+            // Note: Block content will only be mapped if explicitly specified via properties
+            for (const [key, value] of Object.entries(note.properties || {})) {
+                // Skip system/reserved properties
+                const systemProperties = [
+                    'anki-note-type', 'ankinotetype',
+                    'id', 'deck', 'tags', 'extra',
+                    'template', 'disable-anki-sync', 'disableankisync',
+                    'use-namespace-as-default-deck', 'usenamespaceasdefaultdeck'
+                ];
+
+                const keyLower = key.toLowerCase();
+                if (systemProperties.some(prop => prop === keyLower)) {
+                    continue;
+                }
+
+                // Convert property to field name - handle Logseq property normalization
+                let fieldName = key;
+
+                // Logseq normalizes camelCase properties to lowercase, so we need to convert back
+                // Common patterns: archivedate -> archiveDate, testvalue -> testValue, etc.
+                fieldName = this.convertToProperFieldName(key);
+
+                // Handle array values (Logseq properties can be arrays)
+                const rawContent = Array.isArray(value) ? value.join(', ') : value;
+
+                // Special handling for block content mapping
+                if (rawContent.toString() === '{{content}}') {
+                    // Replace with actual block content
+                    customFields[fieldName] = html;
+                } else {
+                    // Use raw content as-is (no HTML conversion for property values)
+                    customFields[fieldName] = rawContent.toString();
+                }
+
+                console.log(`[Custom Fields] Mapped: "${key}" -> "${fieldName}" = "${customFields[fieldName]}"`);
+            }
+
+            console.log(`[Custom Mode] Final customFields:`, customFields);
+        }
 
         if (logseq.settings.includeParentContent) {
             let newHtml = "";
@@ -787,6 +894,38 @@ export class LogseqToAnkiSync {
         assets = new Set([...assets, ...extra.assets]);
         extra = extra.html;
 
-        return [html, assets, deck, breadcrumb, tags, extra, modelName];
+        return [html, assets, deck, breadcrumb, tags, extra, modelName, customFields];
+    }
+
+    // Helper function to convert Logseq normalized property names back to proper Anki field names
+    private convertToProperFieldName(property: string): string {
+        // Common field name mappings - add more as needed
+        const fieldMappings: Record<string, string> = {
+            'archivedate': 'archiveDate',
+            'testvalue': 'testValue',
+            'createddate': 'createdDate',
+            'modifieddate': 'modifiedDate',
+            'sourcepage': 'sourcePage',
+            'extrainfo': 'extraInfo',
+            // Add more mappings as needed
+        };
+
+        // Check for exact match first
+        if (fieldMappings[property]) {
+            return fieldMappings[property];
+        }
+
+        // If no mapping found, try to auto-convert common patterns
+        // Pattern: word1word2 -> word1Word2
+        if (property.length > 6 && property.includes('date')) {
+            return property.replace(/date$/, 'Date');
+        }
+
+        if (property.length > 6 && property.includes('value')) {
+            return property.replace(/value$/, 'Value');
+        }
+
+        // Default: return as-is
+        return property;
     }
 }
